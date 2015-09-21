@@ -15,6 +15,7 @@ NOTE: Not all collection methods are support on MySQL < 5.6
 Name                                       | Description
 -------------------------------------------|------------------------------------------------------------------------------------
 collect.auto_increment.columns             | Collect auto_increment columns and max values from information_schema.
+collect.binlog_size                        | Compute the size of all binlog files combined (as specified by "SHOW MASTER LOGS")
 collect.info_schema.userstats              | If running with userstat=1, set to true to collect user statistics.
 collect.perf_schema.eventsstatements       | Collect time metrics from performance_schema.events_statements_summary_by_digest.
 collect.perf_schema.eventsstatements.limit | Limit the number of events statements digests by response time. (default: 250)
@@ -23,8 +24,6 @@ collect.perf_schema.indexiowaits           | Collect metrics from performance_sc
 collect.perf_schema.indexiowaitstime       | Collect time metrics from performance_schema.table_io_waits_summary_by_index_usage.
 collect.perf_schema.tableiowaits           | Collect metrics from performance_schema.table_io_waits_summary_by_table.
 collect.perf_schema.tableiowaitstime       | Collect time metrics from performance_schema.table_io_waits_summary_by_table.
-collect.perf_schema.tablelocks             | Collect metrics from performance_schema.table_lock_waits_summary_by_table.
-collect.perf_schema.tablelockstime         | Collect time metrics from performance_schema.events_statements_summary_by_digest.
 log.level                                  | Logging verbosity (default: info)
 web.listen-address                         | Address to listen on for web interface and telemetry.
 web.telemetry-path                         | Path under which to expose metrics.

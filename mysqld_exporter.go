@@ -30,6 +30,10 @@ var (
 		"collect.auto_increment.columns", false,
 		"Collect auto_increment columns and max values from information_schema",
 	)
+	binlogSize = flag.Bool(
+		"collect.binlog_size", false,
+		"Collect the current size of all registered binlog files",
+	)
 	perfTableIOWaits = flag.Bool(
 		"collect.perf_schema.tableiowaits", false,
 		"Collect metrics from performance_schema.table_io_waits_summary_by_table",
@@ -45,14 +49,6 @@ var (
 	perfIndexIOWaitsTime = flag.Bool(
 		"collect.perf_schema.indexiowaitstime", false,
 		"Collect time metrics from performance_schema.table_io_waits_summary_by_index_usage",
-	)
-	perfTableLockWaits = flag.Bool(
-		"collect.perf_schema.tablelocks", false,
-		"Collect metrics from performance_schema.table_lock_waits_summary_by_table",
-	)
-	perfTableLockWaitsTime = flag.Bool(
-		"collect.perf_schema.tablelockstime", false,
-		"Collect time metrics from performance_schema.table_lock_waits_summary_by_table",
 	)
 	perfEventsStatements = flag.Bool(
 		"collect.perf_schema.eventsstatements", false,
@@ -86,6 +82,7 @@ const (
 	informationSchema = "info_schema"
 	performanceSchema = "perf_schema"
 	slaveStatus       = "slave_status"
+	binlog            = "binlog"
 )
 
 // Metric SQL Queries.
@@ -93,6 +90,7 @@ const (
 	globalStatusQuery            = `SHOW GLOBAL STATUS`
 	globalVariablesQuery         = `SHOW GLOBAL VARIABLES`
 	slaveStatusQuery             = `SHOW SLAVE STATUS`
+	binlogQuery                  = `SHOW BINARY LOGS`
 	infoSchemaAutoIncrementQuery = `
 		SELECT table_schema, table_name, column_name, auto_increment,
 		  pow(2, case data_type
@@ -125,42 +123,6 @@ const (
 		SELECT OBJECT_SCHEMA, OBJECT_NAME, ifnull(INDEX_NAME, 'NONE') as INDEX_NAME, SUM_TIMER_FETCH, SUM_TIMER_INSERT, SUM_TIMER_UPDATE, SUM_TIMER_DELETE
 		  FROM performance_schema.table_io_waits_summary_by_index_usage
 		  WHERE OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema')
-		`
-	perfTableLockWaitsQuery = `
-		SELECT
-		    OBJECT_SCHEMA,
-		    OBJECT_NAME,
-		    COUNT_READ_NORMAL,
-		    COUNT_READ_WITH_SHARED_LOCKS,
-		    COUNT_READ_HIGH_PRIORITY,
-		    COUNT_READ_NO_INSERT,
-		    COUNT_WRITE_NORMAL,
-		    COUNT_WRITE_ALLOW_WRITE,
-		    COUNT_WRITE_CONCURRENT_INSERT,
-		    COUNT_WRITE_DELAYED,
-		    COUNT_WRITE_LOW_PRIORITY,
-		    COUNT_READ_EXTERNAL,
-		    COUNT_WRITE_EXTERNAL
-		  FROM performance_schema.table_lock_waits_summary_by_table
-		  WHERE OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'information_schema')
-		`
-	perfTableLockWaitsTimeQuery = `
-		SELECT
-		    OBJECT_SCHEMA,
-		    OBJECT_NAME,
-		    SUM_TIMER_READ_NORMAL,
-		    SUM_TIMER_READ_WITH_SHARED_LOCKS,
-		    SUM_TIMER_READ_HIGH_PRIORITY,
-		    SUM_TIMER_READ_NO_INSERT,
-		    SUM_TIMER_WRITE_NORMAL,
-		    SUM_TIMER_WRITE_ALLOW_WRITE,
-		    SUM_TIMER_WRITE_CONCURRENT_INSERT,
-		    SUM_TIMER_WRITE_DELAYED,
-		    SUM_TIMER_WRITE_LOW_PRIORITY,
-		    SUM_TIMER_READ_EXTERNAL,
-		    SUM_TIMER_WRITE_EXTERNAL
-		  FROM performance_schema.table_lock_waits_summary_by_table
-		  WHERE OBJECT_SCHEMA NOT IN ('mysql', 'performance_schema', 'information_schema')
 		`
 	perfEventsStatementsQuery = `
 		SELECT
@@ -198,6 +160,16 @@ var landingPage = []byte(`<html>
 
 // Metric descriptors for dynamically created metrics.
 var (
+	binlogSizeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, binlog, "size"),
+		"Combined size of all registered binlog files.",
+		[]string{}, nil,
+	)
+	binlogFilesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, binlog, "files"),
+		"Number of registered binlog files.",
+		[]string{}, nil,
+	)
 	globalCommandsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, globalStatus, "commands_total"),
 		"Total number of executed MySQL commands.",
@@ -247,26 +219,6 @@ var (
 		prometheus.BuildFQName(namespace, performanceSchema, "index_io_waits_seconds_total"),
 		"The total time of index I/O wait events for each index and operation.",
 		[]string{"schema", "name", "index", "operation"}, nil,
-	)
-	performanceSchemaSQLTableLockWaitsDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, performanceSchema, "sql_lock_waits_total"),
-		"The total number of SQL lock wait events for each table and operation.",
-		[]string{"schema", "name", "operation"}, nil,
-	)
-	performanceSchemaExternalTableLockWaitsDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, performanceSchema, "external_lock_waits_total"),
-		"The total number of external lock wait events for each table and operation.",
-		[]string{"schema", "name", "operation"}, nil,
-	)
-	performanceSchemaSQLTableLockWaitsTimeDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, performanceSchema, "sql_lock_waits_seconds_total"),
-		"The total time of SQL lock wait events for each table and operation.",
-		[]string{"schema", "name", "operation"}, nil,
-	)
-	performanceSchemaExternalTableLockWaitsTimeDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, performanceSchema, "external_lock_waits_seconds_total"),
-		"The total time of external lock wait events for each table and operation.",
-		[]string{"schema", "name", "operation"}, nil,
 	)
 	performanceSchemaEventsStatementsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_total"),
@@ -411,11 +363,6 @@ var (
 	}
 )
 
-// Math constants
-const (
-	picoSeconds = 1e12
-)
-
 // Various regexps.
 var (
 	globalStatusRE = regexp.MustCompile(`^(com|connection_errors|innodb_rows|performance_schema)_(.*)$`)
@@ -528,6 +475,12 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			return
 		}
 	}
+	if *binlogSize {
+		if err = scrapeBinlogSize(db, ch); err != nil {
+			log.Println("Error scraping binlog size:", err)
+			return
+		}
+	}
 	if *perfTableIOWaits {
 		if err = scrapePerfTableIOWaits(db, ch); err != nil {
 			log.Println("Error scraping performance schema:", err)
@@ -545,24 +498,14 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			log.Println("Error scraping performance schema:", err)
 			return
 		}
+
 	}
 	if *perfIndexIOWaitsTime {
 		if err = scrapePerfIndexIOWaitsTime(db, ch); err != nil {
 			log.Println("Error scraping performance schema:", err)
 			return
 		}
-	}
-	if *perfTableLockWaits {
-		if err = scrapePerfTableLockWaits(db, ch); err != nil {
-			log.Println("Error scraping performance schema:", err)
-			return
-		}
-	}
-	if *perfTableLockWaitsTime {
-		if err = scrapePerfTableLockWaitsTime(db, ch); err != nil {
-			log.Println("Error scraping performance schema:", err)
-			return
-		}
+
 	}
 	if *perfEventsStatements {
 		if err = scrapePerfEventsStatements(db, ch); err != nil {
@@ -703,7 +646,7 @@ func scrapeInformationSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		schema, table, column string
-		value, max            uint64
+		value, max            int64
 	)
 
 	for autoIncrementRows.Next() {
@@ -724,6 +667,40 @@ func scrapeInformationSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
 	return nil
 }
 
+func scrapeBinlogSize(db *sql.DB, ch chan<- prometheus.Metric) error {
+	masterLogRows, err := db.Query(binlogQuery)
+	if err != nil {
+		return err
+	}
+	defer masterLogRows.Close()
+
+	var (
+		size     uint64
+		count    uint64
+		filename string
+		filesize uint64
+	)
+	size = 0
+	count = 0
+
+	for masterLogRows.Next() {
+		if err := masterLogRows.Scan(&filename, &filesize); err != nil {
+			return nil
+		}
+		size += filesize
+		count++
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		binlogSizeDesc, prometheus.GaugeValue, float64(size),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		binlogFilesDesc, prometheus.GaugeValue, float64(count),
+	)
+
+	return nil
+}
+
 func scrapePerfTableIOWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
 	perfSchemaTableWaitsRows, err := db.Query(perfTableIOWaitsQuery)
 	if err != nil {
@@ -733,7 +710,7 @@ func scrapePerfTableIOWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		objectSchema, objectName                          string
-		countFetch, countInsert, countUpdate, countDelete uint64
+		countFetch, countInsert, countUpdate, countDelete int64
 	)
 
 	for perfSchemaTableWaitsRows.Next() {
@@ -772,7 +749,7 @@ func scrapePerfTableIOWaitsTime(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		objectSchema, objectName                      string
-		timeFetch, timeInsert, timeUpdate, timeDelete uint64
+		timeFetch, timeInsert, timeUpdate, timeDelete int64
 	)
 
 	for perfSchemaTableWaitsTimeRows.Next() {
@@ -782,19 +759,19 @@ func scrapePerfTableIOWaitsTime(db *sql.DB, ch chan<- prometheus.Metric) error {
 			return err
 		}
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeFetch)/picoSeconds,
+			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeFetch)/1000000000,
 			objectSchema, objectName, "fetch",
 		)
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeInsert)/picoSeconds,
+			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeInsert)/1000000000,
 			objectSchema, objectName, "insert",
 		)
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/picoSeconds,
+			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/1000000000,
 			objectSchema, objectName, "update",
 		)
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/picoSeconds,
+			performanceSchemaTableWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/1000000000,
 			objectSchema, objectName, "delete",
 		)
 	}
@@ -810,7 +787,7 @@ func scrapePerfIndexIOWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		objectSchema, objectName, indexName               string
-		countFetch, countInsert, countUpdate, countDelete uint64
+		countFetch, countInsert, countUpdate, countDelete int64
 	)
 
 	for perfSchemaIndexWaitsRows.Next() {
@@ -852,7 +829,7 @@ func scrapePerfIndexIOWaitsTime(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		objectSchema, objectName, indexName           string
-		timeFetch, timeInsert, timeUpdate, timeDelete uint64
+		timeFetch, timeInsert, timeUpdate, timeDelete int64
 	)
 
 	for perfSchemaIndexWaitsTimeRows.Next() {
@@ -862,173 +839,24 @@ func scrapePerfIndexIOWaitsTime(db *sql.DB, ch chan<- prometheus.Metric) error {
 			return err
 		}
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeFetch)/picoSeconds,
+			performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeFetch)/1000000000,
 			objectSchema, objectName, indexName, "fetch",
 		)
 		// We only update write columns when indexName is NONE.
 		if indexName == "NONE" {
 			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeInsert)/picoSeconds,
+				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeInsert)/1000000000,
 				objectSchema, objectName, indexName, "insert",
 			)
 			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/picoSeconds,
+				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/1000000000,
 				objectSchema, objectName, indexName, "update",
 			)
 			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/picoSeconds,
+				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/1000000000,
 				objectSchema, objectName, indexName, "delete",
 			)
 		}
-	}
-	return nil
-}
-
-func scrapePerfTableLockWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
-	perfSchemaTableLockWaitsRows, err := db.Query(perfTableLockWaitsQuery)
-	if err != nil {
-		return err
-	}
-	defer perfSchemaTableLockWaitsRows.Close()
-
-	var (
-		objectSchema, objectName                      string
-		countReadNormal, countReadWithSharedLocks     uint64
-		countReadHighPriority, countReadNoInsert      uint64
-		countWriteNormal, countWriteAllowWrite        uint64
-		countWriteConcurrentInsert, countWriteDelayed uint64
-		countWriteLowPriority                         uint64
-		countReadExternal, countWriteExternal         uint64
-	)
-
-	for perfSchemaTableLockWaitsRows.Next() {
-		if err := perfSchemaTableLockWaitsRows.Scan(
-			&objectSchema, &objectName, &countReadNormal, &countReadWithSharedLocks,
-			&countReadHighPriority, &countReadNoInsert, &countWriteNormal,
-			&countWriteAllowWrite, &countWriteConcurrentInsert, &countWriteDelayed,
-			&countWriteLowPriority, &countReadExternal, &countWriteExternal,
-		); err != nil {
-			return err
-		}
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countReadNormal),
-			objectSchema, objectName, "read_normal",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countReadWithSharedLocks),
-			objectSchema, objectName, "read_with_shared_locks",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countReadHighPriority),
-			objectSchema, objectName, "read_high_priority",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countReadNoInsert),
-			objectSchema, objectName, "read_no_insert",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteNormal),
-			objectSchema, objectName, "write_normal",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteAllowWrite),
-			objectSchema, objectName, "write_allow_write",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteConcurrentInsert),
-			objectSchema, objectName, "write_concurrent_insert",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteDelayed),
-			objectSchema, objectName, "write_delayed",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteLowPriority),
-			objectSchema, objectName, "write_low_priority",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaExternalTableLockWaitsDesc, prometheus.CounterValue, float64(countReadExternal),
-			objectSchema, objectName, "read",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaExternalTableLockWaitsDesc, prometheus.CounterValue, float64(countWriteExternal),
-			objectSchema, objectName, "write",
-		)
-	}
-	return nil
-}
-
-func scrapePerfTableLockWaitsTime(db *sql.DB, ch chan<- prometheus.Metric) error {
-	// Timers here are returned in picoseconds.
-	perfSchemaTableWaitsTimeRows, err := db.Query(perfTableLockWaitsTimeQuery)
-	if err != nil {
-		return err
-	}
-	defer perfSchemaTableWaitsTimeRows.Close()
-
-	var (
-		objectSchema, objectName                    string
-		timeReadNormal, timeReadWithSharedLocks     uint64
-		timeReadHighPriority, timeReadNoInsert      uint64
-		timeWriteNormal, timeWriteAllowWrite        uint64
-		timeWriteConcurrentInsert, timeWriteDelayed uint64
-		timeWriteLowPriority                        uint64
-		timeReadExternal, timeWriteExternal         uint64
-	)
-
-	for perfSchemaTableWaitsTimeRows.Next() {
-		if err := perfSchemaTableWaitsTimeRows.Scan(
-			&objectSchema, &objectName, &timeReadNormal, &timeReadWithSharedLocks,
-			&timeReadHighPriority, &timeReadNoInsert, &timeWriteNormal,
-			&timeWriteAllowWrite, &timeWriteConcurrentInsert, &timeWriteDelayed,
-			&timeWriteLowPriority, &timeReadExternal, &timeWriteExternal,
-		); err != nil {
-			return err
-		}
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeReadNormal)/picoSeconds,
-			objectSchema, objectName, "read_normal",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeReadWithSharedLocks)/picoSeconds,
-			objectSchema, objectName, "read_with_shared_locks",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeReadHighPriority)/picoSeconds,
-			objectSchema, objectName, "read_high_priority",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeReadNoInsert)/picoSeconds,
-			objectSchema, objectName, "read_no_insert",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteNormal)/picoSeconds,
-			objectSchema, objectName, "write_normal",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteAllowWrite)/picoSeconds,
-			objectSchema, objectName, "write_allow_write",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteConcurrentInsert)/picoSeconds,
-			objectSchema, objectName, "write_concurrent_insert",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteDelayed)/picoSeconds,
-			objectSchema, objectName, "write_delayed",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaSQLTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteLowPriority)/picoSeconds,
-			objectSchema, objectName, "write_low_priority",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaExternalTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeReadExternal)/picoSeconds,
-			objectSchema, objectName, "read",
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaExternalTableLockWaitsTimeDesc, prometheus.CounterValue, float64(timeWriteExternal)/picoSeconds,
-			objectSchema, objectName, "write",
-		)
 	}
 	return nil
 }
@@ -1049,9 +877,9 @@ func scrapePerfEventsStatements(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var (
 		schemaName, digest, digest_text      string
-		count, queryTime, errors, warnings   uint64
-		rowsAffected, rowsSent, rowsExamined uint64
-		tmpTables, tmpDiskTables             uint64
+		count, queryTime, errors, warnings   int64
+		rowsAffected, rowsSent, rowsExamined int64
+		tmpTables, tmpDiskTables             int64
 	)
 
 	for perfSchemaEventsStatementsRows.Next() {
@@ -1069,7 +897,7 @@ func scrapePerfEventsStatements(db *sql.DB, ch chan<- prometheus.Metric) error {
 			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaEventsStatementsTimeDesc, prometheus.CounterValue, float64(queryTime)/picoSeconds,
+			performanceSchemaEventsStatementsTimeDesc, prometheus.CounterValue, float64(queryTime)/1000000000,
 			schemaName, digest,
 		)
 		ch <- prometheus.MustNewConstMetric(
