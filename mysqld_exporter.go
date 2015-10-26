@@ -30,14 +30,6 @@ var (
 		"collect.info_schema.processlist", false,
 		"Collect current thread state counts from the information_schema.processlist",
 	)
-	collectTableSchema = flag.Bool(
-		"collect.info_schema.tables", true,
-		"Collect metrics from information_schema.tables",
-	)
-	tableSchemaDatabases = flag.String(
-		"collect.info_schema.tables.databases", "*",
-		"The list of databases to collect table stats for, or '*' for all",
-	)
 	collectGlobalStatus = flag.Bool(
 		"collect.global_status", true,
 		"Collect from SHOW GLOBAL STATUS",
@@ -212,29 +204,7 @@ const (
 		  COUNT_MISC, SUM_TIMER_MISC
 		  FROM performance_schema.file_summary_by_event_name
 		`
-	userStatQuery    = `SELECT * FROM information_schema.USER_STATISTICS`
-	tableSchemaQuery = `
-		SELECT
-		    TABLE_SCHEMA,
-		    TABLE_NAME,
-		    TABLE_TYPE,
-		    ifnull(ENGINE, 'NONE') as ENGINE,
-		    ifnull(VERSION, '0') as VERSION,
-		    ifnull(ROW_FORMAT, 'NONE') as ROW_FORMAT,
-		    ifnull(TABLE_ROWS, '0') as TABLE_ROWS,
-		    ifnull(DATA_LENGTH, '0') as DATA_LENGTH,
-		    ifnull(INDEX_LENGTH, '0') as INDEX_LENGTH,
-		    ifnull(DATA_FREE, '0') as DATA_FREE,
-		    ifnull(CREATE_OPTIONS, 'NONE') as CREATE_OPTIONS
-		  FROM information_schema.tables
-		  WHERE TABLE_SCHEMA = '%s'
-		`
-	dbListQuery = `
-		SELECT
-		    SCHEMA_NAME
-		  FROM information_schema.schemata
-		  WHERE SCHEMA_NAME NOT IN ('mysql', 'performance_schema', 'information_schema')
-		`
+	userStatQuery = `SELECT * FROM information_schema.USER_STATISTICS`
 )
 
 // landingPage contains the HTML served at '/'.
@@ -285,21 +255,6 @@ var (
 		"The max value of an auto_increment column from information_schema.",
 		[]string{"schema", "table", "column"}, nil,
 	)
-	infoSchemaTablesVersionDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_version"),
-		"The version number of the table's .frm file",
-		[]string{"schema", "table", "type", "engine", "row_format", "create_options"}, nil,
-	)
-	infoSchemaTablesRowsDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_rows"),
-		"The estimated number of rows in the table from information_schema.tables",
-		[]string{"schema", "table"}, nil,
-	)
-	infoSchemaTablesSizeDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_size"),
-		"The size of the table components from information_schema.tables",
-		[]string{"schema", "table", "component"}, nil,
-	)
 	globalPerformanceSchemaLostDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, globalStatus, "performance_schema_lost_total"),
 		"Total number of MySQL instrumentations that could not be loaded or created due to memory constraints.",
@@ -348,52 +303,47 @@ var (
 	performanceSchemaEventsStatementsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_total"),
 		"The total count of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
-	)
-	performanceSchemaEventsStatementsDigestTextDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_digest_text"),
-		"The mapping of query schema text to their digest.",
 		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsTimeDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_seconds_total"),
 		"The total time of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsErrorsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_errors_total"),
 		"The errors of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsWarningsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_warnings_total"),
 		"The warnings of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsRowsAffectedDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_rows_affected_total"),
 		"The total rows affected of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsRowsSentDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_rows_sent_total"),
 		"The total rows sent of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsRowsExaminedDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_rows_examined_total"),
 		"The total rows examined of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsTmpTablesDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_tmp_tables_total"),
 		"The total tmp tables of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsStatementsTmpDiskTablesDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_tmp_disk_tables_total"),
 		"The total tmp disk tables of events statements by digest.",
-		[]string{"schema", "digest"}, nil,
+		[]string{"schema", "digest", "digest_text"}, nil,
 	)
 	performanceSchemaEventsWaitsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_waits_total"),
@@ -718,12 +668,6 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	if *collectProcesslist {
 		if err = scrapeProcesslist(db, ch); err != nil {
 			log.Println("Error scraping process list:", err)
-			return
-		}
-	}
-	if *collectTableSchema {
-		if err = scrapeTableSchema(db, ch); err != nil {
-			log.Println("Error scraping table schema:", err)
 			return
 		}
 	}
@@ -1266,43 +1210,39 @@ func scrapePerfEventsStatements(db *sql.DB, ch chan<- prometheus.Metric) error {
 		}
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsDesc, prometheus.CounterValue, float64(count),
-			schemaName, digest,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			performanceSchemaEventsStatementsDigestTextDesc, prometheus.GaugeValue, 1,
 			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsTimeDesc, prometheus.CounterValue, float64(queryTime)/picoSeconds,
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsErrorsDesc, prometheus.CounterValue, float64(errors),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsWarningsDesc, prometheus.CounterValue, float64(warnings),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsRowsAffectedDesc, prometheus.CounterValue, float64(rowsAffected),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsRowsSentDesc, prometheus.CounterValue, float64(rowsSent),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsRowsExaminedDesc, prometheus.CounterValue, float64(rowsExamined),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsTmpTablesDesc, prometheus.CounterValue, float64(tmpTables),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsTmpDiskTablesDesc, prometheus.CounterValue, float64(tmpDiskTables),
-			schemaName, digest,
+			schemaName, digest, digest_text,
 		)
 	}
 	return nil
@@ -1503,93 +1443,6 @@ func scrapeProcesslist(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	for state, count := range stateCounts {
 		ch <- prometheus.MustNewConstMetric(processlistDesc, prometheus.GaugeValue, float64(count), state)
-	}
-
-	return nil
-}
-
-func scrapeTableSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
-	var dbList []string
-	if *tableSchemaDatabases == "*" {
-		dbListRows, err := db.Query(dbListQuery)
-		if err != nil {
-			return err
-		}
-		defer dbListRows.Close()
-
-		var database string
-
-		for dbListRows.Next() {
-			if err := dbListRows.Scan(
-				&database,
-			); err != nil {
-				return err
-			}
-			dbList = append(dbList, database)
-		}
-	} else {
-		dbList = strings.Split(*tableSchemaDatabases, ",")
-	}
-
-	for _, database := range dbList {
-		tableSchemaRows, err := db.Query(fmt.Sprintf(tableSchemaQuery, database))
-		if err != nil {
-			return err
-		}
-		defer tableSchemaRows.Close()
-
-		var (
-			tableSchema   string
-			tableName     string
-			tableType     string
-			engine        string
-			version       uint64
-			rowFormat     string
-			tableRows     uint64
-			dataLength    uint64
-			indexLength   uint64
-			dataFree      uint64
-			createOptions string
-		)
-
-		for tableSchemaRows.Next() {
-			err = tableSchemaRows.Scan(
-				&tableSchema,
-				&tableName,
-				&tableType,
-				&engine,
-				&version,
-				&rowFormat,
-				&tableRows,
-				&dataLength,
-				&indexLength,
-				&dataFree,
-				&createOptions,
-			)
-			if err != nil {
-				return err
-			}
-			ch <- prometheus.MustNewConstMetric(
-				infoSchemaTablesVersionDesc, prometheus.GaugeValue, float64(version),
-				tableSchema, tableName, tableType, engine, rowFormat, createOptions,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				infoSchemaTablesRowsDesc, prometheus.GaugeValue, float64(tableRows),
-				tableSchema, tableName,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				infoSchemaTablesSizeDesc, prometheus.GaugeValue, float64(dataLength),
-				tableSchema, tableName, "data_length",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				infoSchemaTablesSizeDesc, prometheus.GaugeValue, float64(indexLength),
-				tableSchema, tableName, "index_length",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				infoSchemaTablesSizeDesc, prometheus.GaugeValue, float64(dataFree),
-				tableSchema, tableName, "data_free",
-			)
-		}
 	}
 
 	return nil
