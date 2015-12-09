@@ -97,9 +97,6 @@ var (
 	collectUserStat = flag.Bool("collect.info_schema.userstats", false,
 		"If running with userstat=1, set to true to collect user statistics",
 	)
-	collectTableStat = flag.Bool("collect.info_schema.tablestats", false,
-		"If running with userstat=1, set to true to collect table statistics",
-	)
 )
 
 // Metric name parts.
@@ -196,7 +193,10 @@ const (
 		    SUM_ROWS_SENT,
 		    SUM_ROWS_EXAMINED,
 		    SUM_CREATED_TMP_DISK_TABLES,
-		    SUM_CREATED_TMP_TABLES
+		    SUM_CREATED_TMP_TABLES,
+		    SUM_SORT_MERGE_PASSES,
+		    SUM_SORT_ROWS,
+		    SUM_NO_INDEX_USED
 		  FROM performance_schema.events_statements_summary_by_digest
 		  WHERE SCHEMA_NAME NOT IN ('mysql', 'performance_schema', 'information_schema')
 		    AND last_seen > DATE_SUB(NOW(), INTERVAL %d SECOND)
@@ -216,15 +216,6 @@ const (
 		  FROM performance_schema.file_summary_by_event_name
 		`
 	userStatQuery    = `SELECT * FROM information_schema.USER_STATISTICS`
-	tableStatQuery   = `
-		SELECT
-			TABLE_SCHEMA,
-			TABLE_NAME,
-			ROWS_READ,
-			ROWS_CHANGED,
-			ROWS_CHANGED_X_INDEXES
-		  FROM information_schema.TABLE_STATISTICS
-		`
 	tableSchemaQuery = `
 		SELECT
 		    TABLE_SCHEMA,
@@ -402,6 +393,21 @@ var (
 		"The total tmp disk tables of events statements by digest.",
 		[]string{"schema", "digest", "digest_text"}, nil,
 	)
+	performanceSchemaEventsStatementsSortMergePassesDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_sort_merge_passes_total"),
+		"The total number of merge passes by the sort algorithm performed by digest.",
+		[]string{"schema", "digest", "digest_text"}, nil,
+	)
+	performanceSchemaEventsStatementsSortRowsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_sort_rows_total"),
+		"The total number of sorted rows by digest.",
+		[]string{"schema", "digest", "digest_text"}, nil,
+	)
+	performanceSchemaEventsStatementsNoIndexUsedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, performanceSchema, "events_statements_no_index_used_total"),
+		"The total number of statements that used full table scans by digest.",
+		[]string{"schema", "digest", "digest_text"}, nil,
+	)
 	performanceSchemaEventsWaitsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, performanceSchema, "events_waits_total"),
 		"The total events waits by event name.",
@@ -518,21 +524,6 @@ var (
 				"The number of times this user’s connections connected using SSL to the server.",
 				[]string{"user"}, nil)},
 	}
-	infoSchemaTableStatsRowsReadDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_statistics_rows_read_total"),
-		"The number of rows read from the table.",
-		[]string{"schema", "table"}, nil,
-	)
-	infoSchemaTableStatsRowsChangedDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_statistics_rows_changed_total"),
-		"The number of rows changed in the table.",
-		[]string{"schema", "table"}, nil,
-	)
-	infoSchemaTableStatsRowsChangedXIndexesDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, informationSchema, "table_statistics_rows_changed_x_indexes_total"),
-		"The number of rows changed in the table, multiplied by the number of indexes changed.",
-		[]string{"schema", "table"}, nil,
-	)
 )
 
 // Math constants
@@ -800,12 +791,6 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	if *collectUserStat {
 		if err = scrapeUserStat(db, ch); err != nil {
 			log.Println("Error scraping user stat:", err)
-			return
-		}
-	}
-	if *collectTableStat {
-		if err = scrapeTableStat(db, ch); err != nil {
-			log.Println("Error scraping table stat:", err)
 			return
 		}
 	}
@@ -1284,11 +1269,13 @@ func scrapePerfEventsStatements(db *sql.DB, ch chan<- prometheus.Metric) error {
 		count, queryTime, errors, warnings   uint64
 		rowsAffected, rowsSent, rowsExamined uint64
 		tmpTables, tmpDiskTables             uint64
+		sortMergePasses, sortRows            uint64
+		noIndexUsed                          uint64
 	)
 
 	for perfSchemaEventsStatementsRows.Next() {
 		if err := perfSchemaEventsStatementsRows.Scan(
-			&schemaName, &digest, &digest_text, &count, &queryTime, &errors, &warnings, &rowsAffected, &rowsSent, &rowsExamined, &tmpTables, &tmpDiskTables,
+			&schemaName, &digest, &digest_text, &count, &queryTime, &errors, &warnings, &rowsAffected, &rowsSent, &rowsExamined, &tmpTables, &tmpDiskTables, &sortMergePasses, &sortRows, &noIndexUsed,
 		); err != nil {
 			return err
 		}
@@ -1326,6 +1313,18 @@ func scrapePerfEventsStatements(db *sql.DB, ch chan<- prometheus.Metric) error {
 		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaEventsStatementsTmpDiskTablesDesc, prometheus.CounterValue, float64(tmpDiskTables),
+			schemaName, digest, digest_text,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaEventsStatementsSortMergePassesDesc, prometheus.CounterValue, float64(sortMergePasses),
+			schemaName, digest, digest_text,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaEventsStatementsSortRowsDesc, prometheus.CounterValue, float64(sortRows),
+			schemaName, digest, digest_text,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaEventsStatementsNoIndexUsedDesc, prometheus.CounterValue, float64(noIndexUsed),
 			schemaName, digest, digest_text,
 		)
 	}
@@ -1466,48 +1465,6 @@ func scrapeUserStat(db *sql.DB, ch chan<- prometheus.Metric) error {
 				ch <- prometheus.MustNewConstMetric(desc, prometheus.UntypedValue, float64(userStatData[idx]), user)
 			}
 		}
-	}
-	return nil
-}
-
-func scrapeTableStat(db *sql.DB, ch chan<- prometheus.Metric) error {
-	informationSchemaTableStatisticsRows, err := db.Query(tableStatQuery)
-	if err != nil {
-		return err
-	}
-	defer informationSchemaTableStatisticsRows.Close()
-
-	var (
-		tableSchema   		string
-		tableName     		string
-		rowsRead    		uint64
-		rowsChanged   		uint64
-		rowsChangedXIndexes	uint64
-	)
-
-	for informationSchemaTableStatisticsRows.Next() {
-		err = informationSchemaTableStatisticsRows.Scan(
-			&tableSchema,
-			&tableName,
-			&rowsRead,
-			&rowsChanged,
-			&rowsChangedXIndexes,
-		)
-		if err != nil {
-			return err
-		}
-		ch <- prometheus.MustNewConstMetric(
-			infoSchemaTableStatsRowsReadDesc, prometheus.CounterValue, float64(rowsRead),
-			tableSchema, tableName,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			infoSchemaTableStatsRowsChangedDesc, prometheus.CounterValue, float64(rowsChanged),
-			tableSchema, tableName,
-		)
-		ch <- prometheus.MustNewConstMetric(
-			infoSchemaTableStatsRowsChangedXIndexesDesc, prometheus.CounterValue, float64(rowsChangedXIndexes),
-			tableSchema, tableName,
-		)
 	}
 	return nil
 }
