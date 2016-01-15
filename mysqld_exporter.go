@@ -26,10 +26,6 @@ var (
 		"web.telemetry-path", "/metrics",
 		"Path under which to expose metrics.",
 	)
-	slowLogFilter = flag.Bool(
-		"log_slow_filter", false,
-		"Add a log_slow_filter to avoid exessive MySQL slow logging.  NOTE: Not supported by Oracle MySQL.",
-	)
 	collectProcesslist = flag.Bool(
 		"collect.info_schema.processlist", false,
 		"Collect current thread state counts from the information_schema.processlist",
@@ -122,12 +118,10 @@ const (
 
 // Metric SQL Queries.
 const (
-	sessionSettingsQuery       = `SET SESSION log_slow_filter = 'tmp_table_on_disk,filesort_on_disk'`
 	globalStatusQuery          = `SHOW GLOBAL STATUS`
 	globalVariablesQuery       = `SHOW GLOBAL VARIABLES`
 	slaveStatusQuery           = `SHOW SLAVE STATUS`
 	binlogQuery                = `SHOW BINARY LOGS`
-	logbinQuery                = `SELECT @@log_bin`
 	infoSchemaProcesslistQuery = `
 		SELECT COALESCE(command,''),COALESCE(state,''),count(*)
 		FROM information_schema.processlist
@@ -257,6 +251,7 @@ const (
 		  WHERE SCHEMA_NAME NOT IN ('mysql', 'performance_schema', 'information_schema')
 		`
 )
+var slaveStatusQuerySuffixes = [3]string{" NONBLOCKING", " NOLOCK", ""}
 
 // landingPage contains the HTML served at '/'.
 // TODO: Make this nicer and more informative.
@@ -285,11 +280,6 @@ var (
 		prometheus.BuildFQName(namespace, globalStatus, "commands_total"),
 		"Total number of executed MySQL commands.",
 		[]string{"command"}, nil,
-	)
-	globalHandlerDesc = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, globalStatus, "handlers_total"),
-		"Total number of executed MySQL handlers.",
-		[]string{"handler"}, nil,
 	)
 	globalConnectionErrorsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, globalStatus, "connection_errors_total"),
@@ -656,7 +646,7 @@ var (
 
 // Various regexps.
 var (
-	globalStatusRE = regexp.MustCompile(`^(com|handler|connection_errors|innodb_rows|performance_schema)_(.*)$`)
+	globalStatusRE = regexp.MustCompile(`^(com|connection_errors|innodb_rows|performance_schema)_(.*)$`)
 	logRE          = regexp.MustCompile(`.+\.(\d+)$`)
 )
 
@@ -747,15 +737,6 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		return
 	}
 	defer db.Close()
-
-	if *slowLogFilter {
-		sessionSettingsRows, err := db.Query(sessionSettingsQuery)
-		if err != nil {
-			log.Println("Error setting log_slow_filter:", err)
-			return
-		}
-		sessionSettingsRows.Close()
-	}
 
 	if *collectGlobalStatus {
 		if err = scrapeGlobalStatus(db, ch); err != nil {
@@ -879,10 +860,6 @@ func scrapeGlobalStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
 				ch <- prometheus.MustNewConstMetric(
 					globalCommandsDesc, prometheus.CounterValue, floatVal, match[2],
 				)
-			case "handler":
-				ch <- prometheus.MustNewConstMetric(
-					globalHandlerDesc, prometheus.CounterValue, floatVal, match[2],
-				)
 			case "connection_errors":
 				ch <- prometheus.MustNewConstMetric(
 					globalConnectionErrorsDesc, prometheus.CounterValue, floatVal, match[2],
@@ -910,9 +887,9 @@ func scrapeGlobalVariables(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var key string
 	var val sql.RawBytes
-	var mysqlVersion = map[string]string{
-		"innodb_version":  "",
-		"version":         "",
+	var mysqlVersion = map[string]string {
+		"innodb_version": "",
+		"version": "",
 		"version_comment": "",
 	}
 
@@ -935,14 +912,24 @@ func scrapeGlobalVariables(db *sql.DB, ch chan<- prometheus.Metric) error {
 	// Create mysql_version_info metric
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(prometheus.BuildFQName(namespace, "version", "info"), "MySQL version and distribution.",
-			[]string{"innodb_version", "version", "version_comment"}, nil),
+		[]string{"innodb_version", "version", "version_comment"}, nil),
 		prometheus.GaugeValue, 1, mysqlVersion["innodb_version"], mysqlVersion["version"], mysqlVersion["version_comment"],
 	)
 	return nil
 }
 
 func scrapeSlaveStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
-	slaveStatusRows, err := db.Query(slaveStatusQuery)
+	var (
+		slaveStatusRows *sql.Rows
+		err error
+	)
+	// Leverage lock-free SHOW SLAVE STATUS by guessing the right suffix
+	for _, suffix := range slaveStatusQuerySuffixes {
+		slaveStatusRows, err = db.Query(fmt.Sprint(slaveStatusQuery, suffix))
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1013,16 +1000,6 @@ func scrapeInformationSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
 }
 
 func scrapeBinlogSize(db *sql.DB, ch chan<- prometheus.Metric) error {
-	var logBin uint8
-	err := db.QueryRow(logbinQuery).Scan(&logBin)
-	if err != nil {
-		return err
-	}
-	// If log_bin is OFF, do not run SHOW BINARY LOGS which explicitly produces MySQL error
-	if logBin == 0 {
-		return nil
-	}
-
 	masterLogRows, err := db.Query(binlogQuery)
 	if err != nil {
 		return err
