@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/log"
+	"gopkg.in/ini.v1"
 )
 
 var (
@@ -25,6 +27,14 @@ var (
 	metricPath = flag.String(
 		"web.telemetry-path", "/metrics",
 		"Path under which to expose metrics.",
+	)
+	configMycnf = flag.String(
+		"config.my-cnf", path.Join(os.Getenv("HOME"), ".my.cnf"),
+		"Path to .my.cnf file to read MySQL credentials from.",
+	)
+	slowLogFilter = flag.Bool(
+		"log_slow_filter", false,
+		"Add a log_slow_filter to avoid exessive MySQL slow logging.  NOTE: Not supported by Oracle MySQL.",
 	)
 	collectProcesslist = flag.Bool(
 		"collect.info_schema.processlist", false,
@@ -118,10 +128,12 @@ const (
 
 // Metric SQL Queries.
 const (
+	sessionSettingsQuery       = `SET SESSION log_slow_filter = 'tmp_table_on_disk,filesort_on_disk'`
 	globalStatusQuery          = `SHOW GLOBAL STATUS`
 	globalVariablesQuery       = `SHOW GLOBAL VARIABLES`
 	slaveStatusQuery           = `SHOW SLAVE STATUS`
 	binlogQuery                = `SHOW BINARY LOGS`
+	logbinQuery                = `SELECT @@log_bin`
 	infoSchemaProcesslistQuery = `
 		SELECT COALESCE(command,''),COALESCE(state,''),count(*)
 		FROM information_schema.processlist
@@ -280,6 +292,11 @@ var (
 		prometheus.BuildFQName(namespace, globalStatus, "commands_total"),
 		"Total number of executed MySQL commands.",
 		[]string{"command"}, nil,
+	)
+	globalHandlerDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, globalStatus, "handlers_total"),
+		"Total number of executed MySQL handlers.",
+		[]string{"handler"}, nil,
 	)
 	globalConnectionErrorsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, globalStatus, "connection_errors_total"),
@@ -646,7 +663,7 @@ var (
 
 // Various regexps.
 var (
-	globalStatusRE = regexp.MustCompile(`^(com|connection_errors|innodb_rows|performance_schema)_(.*)$`)
+	globalStatusRE = regexp.MustCompile(`^(com|handler|connection_errors|innodb_rows|performance_schema)_(.*)$`)
 	logRE          = regexp.MustCompile(`.+\.(\d+)$`)
 )
 
@@ -737,6 +754,15 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		return
 	}
 	defer db.Close()
+
+	if *slowLogFilter {
+		sessionSettingsRows, err := db.Query(sessionSettingsQuery)
+		if err != nil {
+			log.Println("Error setting log_slow_filter:", err)
+			return
+		}
+		sessionSettingsRows.Close()
+	}
 
 	if *collectGlobalStatus {
 		if err = scrapeGlobalStatus(db, ch); err != nil {
@@ -860,6 +886,10 @@ func scrapeGlobalStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
 				ch <- prometheus.MustNewConstMetric(
 					globalCommandsDesc, prometheus.CounterValue, floatVal, match[2],
 				)
+			case "handler":
+				ch <- prometheus.MustNewConstMetric(
+					globalHandlerDesc, prometheus.CounterValue, floatVal, match[2],
+				)
 			case "connection_errors":
 				ch <- prometheus.MustNewConstMetric(
 					globalConnectionErrorsDesc, prometheus.CounterValue, floatVal, match[2],
@@ -887,9 +917,9 @@ func scrapeGlobalVariables(db *sql.DB, ch chan<- prometheus.Metric) error {
 
 	var key string
 	var val sql.RawBytes
-	var mysqlVersion = map[string]string {
-		"innodb_version": "",
-		"version": "",
+	var mysqlVersion = map[string]string{
+		"innodb_version":  "",
+		"version":         "",
 		"version_comment": "",
 	}
 
@@ -912,7 +942,7 @@ func scrapeGlobalVariables(db *sql.DB, ch chan<- prometheus.Metric) error {
 	// Create mysql_version_info metric
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(prometheus.BuildFQName(namespace, "version", "info"), "MySQL version and distribution.",
-		[]string{"innodb_version", "version", "version_comment"}, nil),
+			[]string{"innodb_version", "version", "version_comment"}, nil),
 		prometheus.GaugeValue, 1, mysqlVersion["innodb_version"], mysqlVersion["version"], mysqlVersion["version_comment"],
 	)
 	return nil
@@ -1000,6 +1030,16 @@ func scrapeInformationSchema(db *sql.DB, ch chan<- prometheus.Metric) error {
 }
 
 func scrapeBinlogSize(db *sql.DB, ch chan<- prometheus.Metric) error {
+	var logBin uint8
+	err := db.QueryRow(logbinQuery).Scan(&logBin)
+	if err != nil {
+		return err
+	}
+	// If log_bin is OFF, do not run SHOW BINARY LOGS which explicitly produces MySQL error
+	if logBin == 0 {
+		return nil
+	}
+
 	masterLogRows, err := db.Query(binlogQuery)
 	if err != nil {
 		return err
@@ -1739,12 +1779,46 @@ func parseStatus(data sql.RawBytes) (float64, bool) {
 	return value, err == nil
 }
 
+func parseMycnf() (string) {
+	cfg, err := ini.Load(*configMycnf)
+	if err != nil {
+		log.Fatalf("failed reading .my.cnf file: %s", err)
+	}
+	user := cfg.Section("client").Key("user").Validate(func(in string) string {
+		if len(in) == 0 {
+			log.Fatalf("no user specified under [client] in %s", *configMycnf)
+		}
+		return in
+	})
+	password := cfg.Section("client").Key("password").Validate(func(in string) string {
+		if len(in) == 0 {
+			log.Fatalf("no password specified under [client] in %s", *configMycnf)
+		}
+		return in
+	})
+	port := cfg.Section("client").Key("port").Validate(func(in string) string {
+		if len(in) == 0 {
+			return "3306"
+		}
+		return in
+	})
+	socket := cfg.Section("client").Key("socket").String()
+	var dsn string
+	if socket != "" {
+		dsn = fmt.Sprintf("%s:%s@unix(%s)/", user, password, socket)
+	} else {
+		dsn = fmt.Sprintf("%s:%s@tcp(localhost:%s)/", user, password, port)
+	}
+	log.Debugln(dsn)
+	return dsn
+}
+
 func main() {
 	flag.Parse()
 
 	dsn := os.Getenv("DATA_SOURCE_NAME")
 	if len(dsn) == 0 {
-		log.Fatal("couldn't find environment variable DATA_SOURCE_NAME")
+		dsn = parseMycnf()
 	}
 
 	exporter := NewExporter(dsn)
