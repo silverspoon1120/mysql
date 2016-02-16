@@ -146,12 +146,13 @@ const (
 	logbinQuery                = `SELECT @@log_bin`
 	upQuery                    = `SELECT 1`
 	infoSchemaProcesslistQuery = `
-		SELECT COALESCE(command,''),COALESCE(state,''),count(*)
+		SELECT COALESCE(command,''),COALESCE(state,''),count(*),sum(time)
 		  FROM information_schema.processlist
 		  WHERE ID != connection_id()
 		    AND TIME >= %d
 		  GROUP BY command,state
-		  ORDER BY null`
+		  ORDER BY null
+		`
 	infoSchemaAutoIncrementQuery = `
 		SELECT table_schema, table_name, column_name, auto_increment,
 		  pow(2, case data_type
@@ -691,9 +692,13 @@ var (
 		"deleting from main table":                 "deleting",
 		"deleting from reference tables":           "deleting",
 	}
-	processlistDesc = prometheus.NewDesc(
+	processlistCountDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, informationSchema, "threads"),
 		"The number of threads (connections) split by current state.",
+		[]string{"state"}, nil)
+	processlistTimeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, informationSchema, "threads_seconds"),
+		"The number of seconds threads (connections) have used split by current state.",
 		[]string{"state"}, nil)
 )
 
@@ -1787,23 +1792,30 @@ func scrapeProcesslist(db *sql.DB, ch chan<- prometheus.Metric) error {
 		command string
 		state   string
 		count   uint32
+		time    uint32
 	)
 	stateCounts := make(map[string]uint32, len(threadStateCounterMap))
+	stateTime := make(map[string]uint32, len(threadStateCounterMap))
 	for k, v := range threadStateCounterMap {
 		stateCounts[k] = v
+		stateTime[k] = v
 	}
 
 	for processlistRows.Next() {
-		err = processlistRows.Scan(&command, &state, &count)
+		err = processlistRows.Scan(&command, &state, &count, &time)
 		if err != nil {
 			return err
 		}
 		realState := deriveThreadState(command, state)
 		stateCounts[realState] += count
+		stateTime[realState] += time
 	}
 
 	for state, count := range stateCounts {
-		ch <- prometheus.MustNewConstMetric(processlistDesc, prometheus.GaugeValue, float64(count), state)
+		ch <- prometheus.MustNewConstMetric(processlistCountDesc, prometheus.GaugeValue, float64(count), state)
+	}
+	for state, time := range stateTime {
+		ch <- prometheus.MustNewConstMetric(processlistTimeDesc, prometheus.GaugeValue, float64(time), state)
 	}
 
 	return nil
@@ -1964,34 +1976,27 @@ func parseStatus(data sql.RawBytes) (float64, bool) {
 	return value, err == nil
 }
 
-func parseMycnf() string {
-	cfg, err := ini.Load(*configMycnf)
+func parseMycnf(config interface{}) (string, error) {
+	var dsn string
+	cfg, err := ini.Load(config)
 	if err != nil {
-		log.Fatalf("failed reading .my.cnf file: %s", err)
+		return dsn, fmt.Errorf("failed reading ini file: %s", err)
 	}
-	user := cfg.Section("client").Key("user").Validate(func(in string) string {
-		if len(in) == 0 {
-			log.Fatalf("no user specified under [client] in %s", *configMycnf)
-		}
-		return in
-	})
-	password := cfg.Section("client").Key("password").Validate(func(in string) string {
-		if len(in) == 0 {
-			log.Fatalf("no password specified under [client] in %s", *configMycnf)
-		}
-		return in
-	})
+	user := cfg.Section("client").Key("user").String()
+	password := cfg.Section("client").Key("password").String()
+	if (user == "") || (password == "") {
+		return dsn, fmt.Errorf("no user or password specified under [client] in %s", config)
+	}
 	host := cfg.Section("client").Key("host").MustString("localhost")
 	port := cfg.Section("client").Key("port").MustUint(3306)
 	socket := cfg.Section("client").Key("socket").String()
-	var dsn string
 	if socket != "" {
 		dsn = fmt.Sprintf("%s:%s@unix(%s)/", user, password, socket)
 	} else {
 		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
 	}
 	log.Debugln(dsn)
-	return dsn
+	return dsn, nil
 }
 
 func main() {
@@ -1999,7 +2004,10 @@ func main() {
 
 	dsn := os.Getenv("DATA_SOURCE_NAME")
 	if len(dsn) == 0 {
-		dsn = parseMycnf()
+		var err error
+		if dsn, err = parseMycnf(*configMycnf); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	exporter := NewExporter(dsn)
