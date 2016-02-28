@@ -8,7 +8,6 @@ install:
 - go get github.com/go-sql-driver/mysql
 - go get github.com/prometheus/client_golang/prometheus
 - go get github.com/prometheus/log
-- go get github.com/smartystreets/goconvey/convey
 - go get gopkg.in/ini.v1
 - go get gopkg.in/DATA-DOG/go-sqlmock.v1
 
