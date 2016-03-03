@@ -144,6 +144,7 @@ const (
 	slaveStatusQuery           = `SHOW SLAVE STATUS`
 	binlogQuery                = `SHOW BINARY LOGS`
 	logbinQuery                = `SELECT @@log_bin`
+	upQuery                    = `SELECT 1`
 	infoSchemaProcesslistQuery = `
 		SELECT COALESCE(command,''),COALESCE(state,''),count(*)
 		  FROM information_schema.processlist
@@ -708,6 +709,7 @@ type Exporter struct {
 	duration, error prometheus.Gauge
 	totalScrapes    prometheus.Counter
 	scrapeErrors    *prometheus.CounterVec
+	mysqldUp        prometheus.Gauge
 }
 
 // NewExporter returns a new MySQL exporter for the provided DSN.
@@ -737,6 +739,11 @@ func NewExporter(dsn string) *Exporter {
 			Subsystem: exporter,
 			Name:      "last_scrape_error",
 			Help:      "Whether the last scrape of metrics from MySQL resulted in an error (1 for error, 0 for success).",
+		}),
+		mysqldUp: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "up",
+			Help:      "Whether the MySQL server is up.",
 		}),
 	}
 }
@@ -777,6 +784,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- e.totalScrapes
 	ch <- e.error
 	e.scrapeErrors.Collect(ch)
+	ch <- e.mysqldUp
 }
 
 func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
@@ -797,6 +805,14 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		return
 	}
 	defer db.Close()
+
+	_, err = db.Query(upQuery)
+	if err != nil {
+		log.Errorln("Error pinging mysqld:", err)
+		e.mysqldUp.Set(0)
+		return
+	}
+	e.mysqldUp.Set(1)
 
 	if *slowLogFilter {
 		sessionSettingsRows, err := db.Query(sessionSettingsQuery)
@@ -1948,27 +1964,34 @@ func parseStatus(data sql.RawBytes) (float64, bool) {
 	return value, err == nil
 }
 
-func parseMycnf(config interface{}) (string, error) {
-	var dsn string
-	cfg, err := ini.Load(config)
+func parseMycnf() string {
+	cfg, err := ini.Load(*configMycnf)
 	if err != nil {
-		return dsn, fmt.Errorf("failed reading ini file: %s", err)
+		log.Fatalf("failed reading .my.cnf file: %s", err)
 	}
-	user := cfg.Section("client").Key("user").String()
-	password := cfg.Section("client").Key("password").String()
-	if (user == "") || (password == "") {
-		return dsn, fmt.Errorf("no user or password specified under [client] in %s", config)
-	}
+	user := cfg.Section("client").Key("user").Validate(func(in string) string {
+		if len(in) == 0 {
+			log.Fatalf("no user specified under [client] in %s", *configMycnf)
+		}
+		return in
+	})
+	password := cfg.Section("client").Key("password").Validate(func(in string) string {
+		if len(in) == 0 {
+			log.Fatalf("no password specified under [client] in %s", *configMycnf)
+		}
+		return in
+	})
 	host := cfg.Section("client").Key("host").MustString("localhost")
 	port := cfg.Section("client").Key("port").MustUint(3306)
 	socket := cfg.Section("client").Key("socket").String()
+	var dsn string
 	if socket != "" {
 		dsn = fmt.Sprintf("%s:%s@unix(%s)/", user, password, socket)
 	} else {
 		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
 	}
 	log.Debugln(dsn)
-	return dsn, nil
+	return dsn
 }
 
 func main() {
@@ -1976,10 +1999,7 @@ func main() {
 
 	dsn := os.Getenv("DATA_SOURCE_NAME")
 	if len(dsn) == 0 {
-		var err error
-		if dsn, err = parseMycnf(*configMycnf); err != nil {
-			log.Fatal(err)
-		}
+		dsn = parseMycnf()
 	}
 
 	exporter := NewExporter(dsn)
