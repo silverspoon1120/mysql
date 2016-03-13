@@ -120,6 +120,8 @@ var (
 	)
 	collectQueryResponseTime = flag.Bool("collect.info_schema.query_response_time", false,
 		"Collect query response time distribution if query_response_time_stats is ON.")
+	collectEngineTokudbStatus = flag.Bool("collect.engine_tokudb_status", false,
+		"Collect from SHOW ENGINE TOKUDB STATUS")
 )
 
 // Metric name parts.
@@ -134,6 +136,7 @@ const (
 	performanceSchema = "perf_schema"
 	slaveStatus       = "slave_status"
 	binlog            = "binlog"
+	tokudb            = "engine_tokudb"
 )
 
 // Metric SQL Queries.
@@ -143,6 +146,7 @@ const (
 	globalVariablesQuery       = `SHOW GLOBAL VARIABLES`
 	slaveStatusQuery           = `SHOW SLAVE STATUS`
 	binlogQuery                = `SHOW BINARY LOGS`
+	engineTokudbStatusQuery    = `SHOW ENGINE TOKUDB STATUS`
 	logbinQuery                = `SELECT @@log_bin`
 	upQuery                    = `SELECT 1`
 	infoSchemaProcesslistQuery = `
@@ -942,6 +946,12 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 			e.scrapeErrors.WithLabelValues("collect.info_schema.query_response_time").Inc()
 		}
 	}
+	if *collectEngineTokudbStatus {
+		if err = scrapeEngineTokudbStatus(db, ch); err != nil {
+			log.Errorln("Error scraping TokuDB engine status:", err)
+			e.scrapeErrors.WithLabelValues("collect.engine_tokudb_status").Inc()
+		}
+	}
 }
 
 func scrapeGlobalStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
@@ -1253,21 +1263,21 @@ func scrapePerfIndexIOWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
 			performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countFetch),
 			objectSchema, objectName, indexName, "fetch",
 		)
-		// We only update write columns when indexName is NONE.
+		// We only include the insert column when indexName is NONE.
 		if indexName == "NONE" {
 			ch <- prometheus.MustNewConstMetric(
 				performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countInsert),
 				objectSchema, objectName, indexName, "insert",
 			)
-			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countUpdate),
-				objectSchema, objectName, indexName, "update",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countDelete),
-				objectSchema, objectName, indexName, "delete",
-			)
 		}
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countUpdate),
+			objectSchema, objectName, indexName, "update",
+		)
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaIndexWaitsDesc, prometheus.CounterValue, float64(countDelete),
+			objectSchema, objectName, indexName, "delete",
+		)
 		ch <- prometheus.MustNewConstMetric(
 			performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeFetch)/picoSeconds,
 			objectSchema, objectName, indexName, "fetch",
@@ -1278,15 +1288,15 @@ func scrapePerfIndexIOWaits(db *sql.DB, ch chan<- prometheus.Metric) error {
 				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeInsert)/picoSeconds,
 				objectSchema, objectName, indexName, "insert",
 			)
-			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/picoSeconds,
-				objectSchema, objectName, indexName, "update",
-			)
-			ch <- prometheus.MustNewConstMetric(
-				performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/picoSeconds,
-				objectSchema, objectName, indexName, "delete",
-			)
 		}
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeUpdate)/picoSeconds,
+			objectSchema, objectName, indexName, "update",
+		)
+		ch <- prometheus.MustNewConstMetric(
+			performanceSchemaIndexWaitsTimeDesc, prometheus.CounterValue, float64(timeDelete)/picoSeconds,
+			objectSchema, objectName, indexName, "delete",
+		)
 	}
 	return nil
 }
@@ -1971,6 +1981,50 @@ func scrapeInnodbMetrics(db *sql.DB, ch chan<- prometheus.Metric) error {
 				description,
 				prometheus.GaugeValue,
 				float64(value),
+			)
+		}
+	}
+	return nil
+}
+
+func sanitizeTokudbMetric(metricName string) string {
+	replacements := map[string]string{
+		">": "",
+		",": "",
+		":": "",
+		"(": "",
+		")": "",
+		" ": "_",
+		"-": "_",
+		"+": "and",
+		"/": "and",
+	}
+	for r := range replacements {
+		metricName = strings.Replace(metricName, r, replacements[r], -1)
+	}
+	return metricName
+}
+
+func scrapeEngineTokudbStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
+	tokudbRows, err := db.Query(engineTokudbStatusQuery)
+	if err != nil {
+		return err
+	}
+	defer tokudbRows.Close()
+
+	var temp, key string
+	var val sql.RawBytes
+
+	for tokudbRows.Next() {
+		if err := tokudbRows.Scan(&temp, &key, &val); err != nil {
+			return err
+		}
+		key = strings.ToLower(key)
+		if floatVal, ok := parseStatus(val); ok {
+			ch <- prometheus.MustNewConstMetric(
+				newDesc(tokudb, sanitizeTokudbMetric(key), "Generic metric from SHOW ENGINE TOKUDB STATUS."),
+				prometheus.UntypedValue,
+				floatVal,
 			)
 		}
 	}
