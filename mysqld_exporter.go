@@ -120,8 +120,6 @@ var (
 	)
 	collectQueryResponseTime = flag.Bool("collect.info_schema.query_response_time", false,
 		"Collect query response time distribution if query_response_time_stats is ON.")
-	collectEngineTokudbStatus = flag.Bool("collect.engine_tokudb_status", false,
-		"Collect from SHOW ENGINE TOKUDB STATUS")
 )
 
 // Metric name parts.
@@ -136,7 +134,6 @@ const (
 	performanceSchema = "perf_schema"
 	slaveStatus       = "slave_status"
 	binlog            = "binlog"
-	tokudb            = "engine_tokudb"
 )
 
 // Metric SQL Queries.
@@ -146,7 +143,6 @@ const (
 	globalVariablesQuery       = `SHOW GLOBAL VARIABLES`
 	slaveStatusQuery           = `SHOW SLAVE STATUS`
 	binlogQuery                = `SHOW BINARY LOGS`
-	engineTokudbStatusQuery    = `SHOW ENGINE TOKUDB STATUS`
 	logbinQuery                = `SELECT @@log_bin`
 	upQuery                    = `SELECT 1`
 	infoSchemaProcesslistQuery = `
@@ -825,12 +821,14 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 	defer db.Close()
 
-	_, err = db.Query(upQuery)
+	isUpRows, err := db.Query(upQuery)
 	if err != nil {
 		log.Errorln("Error pinging mysqld:", err)
 		e.mysqldUp.Set(0)
 		return
 	}
+	isUpRows.Close()
+
 	e.mysqldUp.Set(1)
 
 	if *slowLogFilter {
@@ -942,12 +940,6 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 		if err = scrapeQueryResponseTime(db, ch); err != nil {
 			log.Errorln("Error scraping query response time:", err)
 			e.scrapeErrors.WithLabelValues("collect.info_schema.query_response_time").Inc()
-		}
-	}
-	if *collectEngineTokudbStatus {
-		if err = scrapeEngineTokudbStatus(db, ch); err != nil {
-			log.Errorln("Error scraping TokuDB engine status:", err)
-			e.scrapeErrors.WithLabelValues("collect.engine_tokudb_status").Inc()
 		}
 	}
 }
@@ -1979,50 +1971,6 @@ func scrapeInnodbMetrics(db *sql.DB, ch chan<- prometheus.Metric) error {
 				description,
 				prometheus.GaugeValue,
 				float64(value),
-			)
-		}
-	}
-	return nil
-}
-
-func sanitizeTokudbMetric(metricName string) string {
-	replacements := map[string]string{
-		">": "",
-		",": "",
-		":": "",
-		"(": "",
-		")": "",
-		" ": "_",
-		"-": "_",
-		"+": "and",
-		"/": "and",
-	}
-	for r := range replacements {
-		metricName = strings.Replace(metricName, r, replacements[r], -1)
-	}
-	return metricName
-}
-
-func scrapeEngineTokudbStatus(db *sql.DB, ch chan<- prometheus.Metric) error {
-	tokudbRows, err := db.Query(engineTokudbStatusQuery)
-	if err != nil {
-		return err
-	}
-	defer tokudbRows.Close()
-
-	var temp, key string
-	var val sql.RawBytes
-
-	for tokudbRows.Next() {
-		if err := tokudbRows.Scan(&temp, &key, &val); err != nil {
-			return err
-		}
-		key = strings.ToLower(key)
-		if floatVal, ok := parseStatus(val); ok {
-			ch <- prometheus.MustNewConstMetric(
-				newDesc(tokudb, sanitizeTokudbMetric(key), "Generic metric from SHOW ENGINE TOKUDB STATUS."),
-				prometheus.UntypedValue,
-				floatVal,
 			)
 		}
 	}
