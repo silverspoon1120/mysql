@@ -36,7 +36,7 @@ const (
 
 	// Maximum allowed depth when recursively substituing variable names.
 	_DEPTH_VALUES = 99
-	_VERSION      = "1.21.1"
+	_VERSION      = "1.10.1"
 )
 
 // Version returns current package version literal.
@@ -56,9 +56,6 @@ var (
 	// Indicate whether to align "=" sign with spaces to produce pretty output
 	// or reduce all possible spaces for compact format.
 	PrettyFormat = true
-
-	// Explicitly write DEFAULT section header
-	DefaultHeader = false
 )
 
 func init() {
@@ -126,20 +123,20 @@ type File struct {
 	// To keep data in order.
 	sectionList []string
 
-	options LoadOptions
+	// Whether the parser should ignore nonexistent files or return error.
+	looseMode bool
 
 	NameMapper
-	ValueMapper
 }
 
 // newFile initializes File object with given data sources.
-func newFile(dataSources []dataSource, opts LoadOptions) *File {
+func newFile(dataSources []dataSource, looseMode bool) *File {
 	return &File{
 		BlockMode:   true,
 		dataSources: dataSources,
 		sections:    make(map[string]*Section),
 		sectionList: make([]string, 0, 10),
-		options:     opts,
+		looseMode:   looseMode,
 	}
 }
 
@@ -154,19 +151,7 @@ func parseDataSource(source interface{}) (dataSource, error) {
 	}
 }
 
-type LoadOptions struct {
-	// Loose indicates whether the parser should ignore nonexistent files or return error.
-	Loose bool
-	// Insensitive indicates whether the parser forces all section and key names to lowercase.
-	Insensitive bool
-	// IgnoreContinuation indicates whether to ignore continuation lines while parsing.
-	IgnoreContinuation bool
-	// AllowBooleanKeys indicates whether to allow boolean type keys or treat as value is missing.
-	// This type of keys are mostly used in my.cnf.
-	AllowBooleanKeys bool
-}
-
-func LoadSources(opts LoadOptions, source interface{}, others ...interface{}) (_ *File, err error) {
+func loadSources(looseMode bool, source interface{}, others ...interface{}) (_ *File, err error) {
 	sources := make([]dataSource, len(others)+1)
 	sources[0], err = parseDataSource(source)
 	if err != nil {
@@ -178,7 +163,7 @@ func LoadSources(opts LoadOptions, source interface{}, others ...interface{}) (_
 			return nil, err
 		}
 	}
-	f := newFile(sources, opts)
+	f := newFile(sources, looseMode)
 	if err = f.Reload(); err != nil {
 		return nil, err
 	}
@@ -189,19 +174,13 @@ func LoadSources(opts LoadOptions, source interface{}, others ...interface{}) (_
 // Arguments can be mixed of file name with string type, or raw data in []byte.
 // It will return error if list contains nonexistent files.
 func Load(source interface{}, others ...interface{}) (*File, error) {
-	return LoadSources(LoadOptions{}, source, others...)
+	return loadSources(false, source, others...)
 }
 
 // LooseLoad has exactly same functionality as Load function
 // except it ignores nonexistent files instead of returning error.
 func LooseLoad(source interface{}, others ...interface{}) (*File, error) {
-	return LoadSources(LoadOptions{Loose: true}, source, others...)
-}
-
-// InsensitiveLoad has exactly same functionality as Load function
-// except it forces all section and key names to be lowercased.
-func InsensitiveLoad(source interface{}, others ...interface{}) (*File, error) {
-	return LoadSources(LoadOptions{Insensitive: true}, source, others...)
+	return loadSources(true, source, others...)
 }
 
 // Empty returns an empty file object.
@@ -215,8 +194,6 @@ func Empty() *File {
 func (f *File) NewSection(name string) (*Section, error) {
 	if len(name) == 0 {
 		return nil, errors.New("error creating new section: empty section name")
-	} else if f.options.Insensitive && name != DEFAULT_SECTION {
-		name = strings.ToLower(name)
 	}
 
 	if f.BlockMode {
@@ -247,8 +224,6 @@ func (f *File) NewSections(names ...string) (err error) {
 func (f *File) GetSection(name string) (*Section, error) {
 	if len(name) == 0 {
 		name = DEFAULT_SECTION
-	} else if f.options.Insensitive {
-		name = strings.ToLower(name)
 	}
 
 	if f.BlockMode {
@@ -326,7 +301,7 @@ func (f *File) Reload() (err error) {
 	for _, s := range f.dataSources {
 		if err = f.reload(s); err != nil {
 			// In loose mode, we create an empty default section for nonexistent files.
-			if os.IsNotExist(err) && f.options.Loose {
+			if os.IsNotExist(err) && f.looseMode {
 				f.parse(bytes.NewBuffer(nil))
 				continue
 			}
@@ -375,7 +350,7 @@ func (f *File) WriteToIndent(w io.Writer, indent string) (n int64, err error) {
 			}
 		}
 
-		if i > 0 || DefaultHeader {
+		if i > 0 {
 			if _, err = buf.WriteString("[" + sname + "]" + LineBreak); err != nil {
 				return 0, err
 			}
@@ -386,22 +361,12 @@ func (f *File) WriteToIndent(w io.Writer, indent string) (n int64, err error) {
 			}
 		}
 
-		// Count and generate alignment length and buffer spaces using the
-		// longest key. Keys may be modifed if they contain certain characters so
-		// we need to take that into account in our calculation.
+		// Count and generate alignment length and buffer spaces
 		alignLength := 0
 		if PrettyFormat {
-			for _, kname := range sec.keyList {
-				keyLength := len(kname)
-				// First case will surround key by ` and second by """
-				if strings.ContainsAny(kname, "\"=:") {
-					keyLength += 2
-				} else if strings.Contains(kname, "`") {
-					keyLength += 6
-				}
-
-				if keyLength > alignLength {
-					alignLength = keyLength
+			for i := 0; i < len(sec.keyList); i++ {
+				if len(sec.keyList[i]) > alignLength {
+					alignLength = len(sec.keyList[i])
 				}
 			}
 		}
@@ -426,7 +391,7 @@ func (f *File) WriteToIndent(w io.Writer, indent string) (n int64, err error) {
 			}
 
 			switch {
-			case key.isAutoIncrement:
+			case key.isAutoIncr:
 				kname = "-"
 			case strings.ContainsAny(kname, "\"=:"):
 				kname = "`" + kname + "`"
@@ -435,10 +400,6 @@ func (f *File) WriteToIndent(w io.Writer, indent string) (n int64, err error) {
 			}
 			if _, err = buf.WriteString(kname); err != nil {
 				return 0, err
-			}
-
-			if key.isBooleanType {
-				continue
 			}
 
 			// Write out alignment spaces before "=" sign

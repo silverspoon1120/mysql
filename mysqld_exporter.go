@@ -109,14 +109,9 @@ var (
 		"If running with userstat=1, set to true to collect table statistics",
 	)
 	collectQueryResponseTime = flag.Bool("collect.info_schema.query_response_time", false,
-		"Collect query response time distribution if query_response_time_stats is ON.",
-	)
+		"Collect query response time distribution if query_response_time_stats is ON.")
 	collectEngineTokudbStatus = flag.Bool("collect.engine_tokudb_status", false,
-		"Collect from SHOW ENGINE TOKUDB STATUS",
-	)
-	collectEngineInnodbStatus = flag.Bool("collect.engine_innodb_status", false,
-		"Collect from SHOW ENGINE INNODB STATUS",
-	)
+		"Collect from SHOW ENGINE TOKUDB STATUS")
 )
 
 // Metric name parts.
@@ -173,7 +168,7 @@ func NewExporter(dsn string) *Exporter {
 			Namespace: namespace,
 			Subsystem: exporter,
 			Name:      "scrape_errors_total",
-			Help:      "Total number of times an error occurred scraping a MySQL.",
+			Help:      "Total number of times an error occured scraping a MySQL.",
 		}, []string{"collector"}),
 		error: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -292,7 +287,7 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 	if *collectTableSchema {
 		if err = collector.ScrapeTableSchema(db, ch); err != nil {
-			log.Errorln("Error scraping for collect.info_schema.tables:", err)
+			log.Errorln("Error scraping collect.info_schema.tables:", err)
 			e.scrapeErrors.WithLabelValues("collect.info_schema.tables").Inc()
 		}
 	}
@@ -370,26 +365,20 @@ func (e *Exporter) scrape(ch chan<- prometheus.Metric) {
 	}
 	if *collectTableStat {
 		if err = collector.ScrapeTableStat(db, ch); err != nil {
-			log.Errorln("Error scraping for collect.info_schema.tablestats:", err)
+			log.Errorln("Error scraping table stat:", err)
 			e.scrapeErrors.WithLabelValues("collect.info_schema.tablestats").Inc()
 		}
 	}
 	if *collectQueryResponseTime {
 		if err = collector.ScrapeQueryResponseTime(db, ch); err != nil {
-			log.Errorln("Error scraping for collect.info_schema.query_response_time:", err)
+			log.Errorln("Error scraping query response time:", err)
 			e.scrapeErrors.WithLabelValues("collect.info_schema.query_response_time").Inc()
 		}
 	}
 	if *collectEngineTokudbStatus {
 		if err = collector.ScrapeEngineTokudbStatus(db, ch); err != nil {
-			log.Errorln("Error scraping for collect.engine_tokudb_status:", err)
+			log.Errorln("Error scraping TokuDB engine status:", err)
 			e.scrapeErrors.WithLabelValues("collect.engine_tokudb_status").Inc()
-		}
-	}
-	if *collectEngineInnodbStatus {
-		if err = collector.ScrapeEngineInnodbStatus(db, ch); err != nil {
-			log.Errorln("Error scraping for collect.engine_innodb_status:", err)
-			e.scrapeErrors.WithLabelValues("collect.engine_innodb_status").Inc()
 		}
 	}
 }

@@ -1,9 +1,10 @@
-// Scrape `information_schema.query_response_time*` tables.
+// Scrape `information_schema.query_response_time`.
 
 package collector
 
 import (
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -11,38 +12,42 @@ import (
 	"github.com/prometheus/common/log"
 )
 
-const queryResponseCheckQuery = `SELECT @@query_response_time_stats`
-
-var (
-	// Use uppercase for table names, otherwise read/write split will return the same results as total
-	// due to the bug.
-	queryResponseTimeQueries = [3]string{
-		"SELECT TIME, COUNT, TOTAL FROM INFORMATION_SCHEMA.QUERY_RESPONSE_TIME",
-		"SELECT TIME, COUNT, TOTAL FROM INFORMATION_SCHEMA.QUERY_RESPONSE_TIME_READ",
-		"SELECT TIME, COUNT, TOTAL FROM INFORMATION_SCHEMA.QUERY_RESPONSE_TIME_WRITE",
-	}
-
-	infoSchemaQueryResponseTimeCountDescs = [3]*prometheus.Desc{
-		prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, informationSchema, "query_response_time_seconds"),
-			"The number of all queries by duration they took to execute.",
-			[]string{}, nil,
-		),
-		prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, informationSchema, "read_query_response_time_seconds"),
-			"The number of read queries by duration they took to execute.",
-			[]string{}, nil,
-		),
-		prometheus.NewDesc(
-			prometheus.BuildFQName(namespace, informationSchema, "write_query_response_time_seconds"),
-			"The number of write queries by duration they took to execute.",
-			[]string{}, nil,
-		),
-	}
+const (
+	queryResponseCheckQuery = `SELECT @@query_response_time_stats`
+	queryResponseTimeQuery  = `
+		SELECT
+		    TIME, COUNT, TOTAL
+		  FROM information_schema.query_response_time
+		`
 )
 
-func processQueryResponseTimeTable(db *sql.DB, ch chan<- prometheus.Metric, query string, i int) error {
-	queryDistributionRows, err := db.Query(query)
+var (
+	infoSchemaQueryResponseTimeCountDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, informationSchema, "query_response_time_count"),
+		"The number of queries according to the length of time they took to execute.",
+		[]string{}, nil,
+	)
+	infoSchemaQueryResponseTimeTotalDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, informationSchema, "query_response_time_total"),
+		"Total time of queries according to the length of time they took to execute separately.",
+		[]string{"le"}, nil,
+	)
+)
+
+// ScrapeQueryResponseTime collects from `information_schema.query_response_time`.
+func ScrapeQueryResponseTime(db *sql.DB, ch chan<- prometheus.Metric) error {
+	var queryStats uint8
+	err := db.QueryRow(queryResponseCheckQuery).Scan(&queryStats)
+	if err != nil {
+		log.Debugln("Query response time distribution is not present.")
+		return nil
+	}
+	if queryStats == 0 {
+		log.Debugln("query_response_time_stats is OFF.")
+		return nil
+	}
+
+	queryDistributionRows, err := db.Query(queryResponseTimeQuery)
 	if err != nil {
 		return err
 	}
@@ -77,34 +82,19 @@ func processQueryResponseTimeTable(db *sql.DB, ch chan<- prometheus.Metric, quer
 			continue
 		}
 		countBuckets[length] = histogramCnt
+		// No histogram with query total times because they are float
+		ch <- prometheus.MustNewConstMetric(
+			infoSchemaQueryResponseTimeTotalDesc, prometheus.CounterValue, histogramSum,
+			fmt.Sprintf("%v", length),
+		)
 	}
+	ch <- prometheus.MustNewConstMetric(
+		infoSchemaQueryResponseTimeTotalDesc, prometheus.CounterValue, histogramSum,
+		"+Inf",
+	)
 	// Create histogram with query counts
 	ch <- prometheus.MustNewConstHistogram(
-		infoSchemaQueryResponseTimeCountDescs[i], histogramCnt, histogramSum, countBuckets,
+		infoSchemaQueryResponseTimeCountDesc, histogramCnt, histogramSum, countBuckets,
 	)
-	return nil
-}
-
-// ScrapeQueryResponseTime collects from `information_schema.query_response_time`.
-func ScrapeQueryResponseTime(db *sql.DB, ch chan<- prometheus.Metric) error {
-	var queryStats uint8
-	err := db.QueryRow(queryResponseCheckQuery).Scan(&queryStats)
-	if err != nil {
-		log.Debugln("Query response time distribution is not present.")
-		return nil
-	}
-	if queryStats == 0 {
-		log.Debugln("query_response_time_stats is OFF.")
-		return nil
-	}
-
-	for i, query := range queryResponseTimeQueries {
-		err := processQueryResponseTimeTable(db, ch, query, i)
-		// The first query should not fail if query_response_time_stats is ON,
-		// unlike the other two when the read/write tables exist only with Percona Server 5.6/5.7.
-		if i == 0 && err != nil {
-			return err
-		}
-	}
 	return nil
 }
