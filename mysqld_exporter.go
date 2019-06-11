@@ -274,7 +274,8 @@ func main() {
 		}
 	}
 	handlerFunc := newHandler(collector.NewMetrics(), enabledScrapers)
-	http.Handle(*metricPath, promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, handlerFunc))
+	//lint:ignore SA1019 relax staticcheck verification.
+	http.HandleFunc(*metricPath, prometheus.InstrumentHandlerFunc("metrics", handlerFunc))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write(landingPage)
 	})
