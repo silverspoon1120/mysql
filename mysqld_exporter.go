@@ -23,7 +23,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -196,7 +195,7 @@ func newHandler(metrics collector.Metrics, scrapers []collector.Scraper, logger 
 				r = r.WithContext(ctx)
 			}
 		}
-		level.Debug(logger).Log("msg", "collect[] params", "params", strings.Join(params, ","))
+		level.Debug(logger).Log("msg", "collect[] params", "params", params)
 
 		// Check if we have some "collect[]" query parameters.
 		if len(params) > 0 {
