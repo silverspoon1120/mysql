@@ -15,7 +15,6 @@ package collector
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -32,18 +31,11 @@ func TestScrapeInfoSchemaInnodbTablespaces(t *testing.T) {
 	}
 	defer db.Close()
 
-	columns := []string{"TABLE_NAME"}
+	columns := []string{"SPACE", "NAME", "FILE_FORMAT", "ROW_FORMAT", "SPACE_TYPE", "FILE_SIZE", "ALLOCATED_SIZE"}
 	rows := sqlmock.NewRows(columns).
-		AddRow("INNODB_SYS_TABLESPACES")
-	mock.ExpectQuery(sanitizeQuery(innodbTablespacesTablenameQuery)).WillReturnRows(rows)
-
-	tablespacesTablename := "INNODB_SYS_TABLESPACES"
-	columns = []string{"SPACE", "NAME", "FILE_FORMAT", "ROW_FORMAT", "SPACE_TYPE", "FILE_SIZE", "ALLOCATED_SIZE"}
-	rows = sqlmock.NewRows(columns).
 		AddRow(1, "sys/sys_config", "Barracuda", "Dynamic", "Single", 100, 100).
 		AddRow(2, "db/compressed", "Barracuda", "Compressed", "Single", 300, 200)
-	query := fmt.Sprintf(innodbTablespacesQuery, tablespacesTablename, tablespacesTablename)
-	mock.ExpectQuery(sanitizeQuery(query)).WillReturnRows(rows)
+	mock.ExpectQuery(sanitizeQuery(innodbTablespacesQuery)).WillReturnRows(rows)
 
 	ch := make(chan prometheus.Metric)
 	go func() {
