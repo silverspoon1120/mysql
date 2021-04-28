@@ -34,8 +34,6 @@ import (
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
-	"github.com/prometheus/exporter-toolkit/web"
-	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"gopkg.in/ini.v1"
 
@@ -43,7 +41,6 @@ import (
 )
 
 var (
-	webConfig     = webflag.AddFlags(kingpin.CommandLine)
 	listenAddress = kingpin.Flag(
 		"web.listen-address",
 		"Address to listen on for web interface and telemetry.",
@@ -301,8 +298,7 @@ func main() {
 	})
 
 	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-	srv := &http.Server{Addr: *listenAddress}
-	if err := web.ListenAndServe(srv, *webConfig, logger); err != nil {
+	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
 		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
