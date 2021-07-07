@@ -19,7 +19,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -35,7 +34,6 @@ const (
 )
 
 var logRE = regexp.MustCompile(`.+\.(\d+)$`)
-var sslMetricDateRe = regexp.MustCompile(`.+\d{2}:\d{2}:\d{2} \d{4} [A-Z]{3}$`)
 
 func newDesc(subsystem, name, help string) *prometheus.Desc {
 	return prometheus.NewDesc(
@@ -45,7 +43,6 @@ func newDesc(subsystem, name, help string) *prometheus.Desc {
 }
 
 func parseStatus(data sql.RawBytes) (float64, bool) {
-	var dateLayout = "2006-01-02 15:04:05"
 	dataString := strings.ToLower(string(data))
 	switch dataString {
 	case "yes", "on":
@@ -60,12 +57,6 @@ func parseStatus(data sql.RawBytes) (float64, bool) {
 		return 1, true
 	case "non-primary", "disconnected":
 		return 0, true
-	}
-	if sslMetricDateRe.FindString(string(data)) != "" {
-		dateLayout = "Jan 02 15:04:05 2006 MST"
-	}
-	if ts, err := time.Parse(dateLayout, string(data)); err == nil {
-		return float64(ts.Unix()), true
 	}
 	if logNum := logRE.Find(data); logNum != nil {
 		value, err := strconv.ParseFloat(string(logNum), 64)
